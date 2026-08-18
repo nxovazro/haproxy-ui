@@ -6,10 +6,19 @@ from flask import Response, stream_with_context
 
 import app.modules.server.ssh as mod_ssh
 import app.modules.server.server as server_mod
+from app.modules.server.command import build_remote_command, build_remote_pipeline, run_local, stream_local
+
+
+def _text_lines(lines) -> list[str]:
+    decoded_lines = []
+    for line in lines:
+        if isinstance(line, bytes):
+            line = line.decode('utf-8', errors='backslashreplace')
+        decoded_lines.append(line)
+    return decoded_lines
 
 
 def ping_from_server(server_from: str, server_to: str, action: str) -> Response:
-    action_for_sending = ''
     if server_to == '':
         raise Exception('warning: Wrong IP address or name')
 
@@ -33,18 +42,22 @@ def ping_from_server(server_from: str, server_to: str, action: str) -> Response:
                     yield f'{i}<br />'
         yield '</div>'
 
-    if action == 'nettools_ping':
-        action_for_sending = 'ping -c 4 -W 1 -s 56 -O '
-    elif action == 'nettools_trace':
-        action_for_sending = 'tracepath -m 10 '
-
-    action_for_sending = action_for_sending + server_to
+    if action in ('nettools_ping', 'ping'):
+        executable = 'ping'
+        arguments = ['-c', '4', '-W', '1', '-s', '56', '-O', server_to]
+    elif action in ('nettools_trace', 'trace'):
+        executable = 'tracepath'
+        arguments = ['-m', '10', server_to]
+    else:
+        raise ValueError('Unsupported network action')
 
     if server_from == 'localhost':
-        return Response(stream_with_context(paint_output(server_mod.subprocess_execute_stream(action_for_sending))), mimetype='text/html')
+        output = stream_local([executable, *arguments])
+        return Response(stream_with_context(paint_output(output)), mimetype='text/html')
     else:
         ssh_generator = mod_ssh.ssh_connect(server_from)
-        return Response(stream_with_context(paint_output(ssh_generator.generate(action_for_sending))), mimetype='text/html')
+        command = build_remote_command(executable, arguments)
+        return Response(stream_with_context(paint_output(ssh_generator.generate(command))), mimetype='text/html')
 
 
 def telnet_from_server(server_from: str, server_to: str, port_to: int) -> str:
@@ -54,13 +67,21 @@ def telnet_from_server(server_from: str, server_to: str, port_to: int) -> str:
 
     if server_to == '':
         return 'warning: enter a correct IP or DNS name'
+    if port_to is None:
+        return 'warning: enter a correct port'
 
+    arguments = [server_to, port_to, '-t', '-w', '1s']
     if server_from == 'localhost':
-        action_for_sending = f'echo "exit"|nc {server_to} {port_to} -t -w 1s'
-        output, stderr = server_mod.subprocess_execute(action_for_sending)
+        result = run_local(['nc', *arguments], input_text='exit\n', timeout=5)
+        output = result.stdout_lines
+        stderr = result.stderr
     else:
-        action_for_sending = f'echo "exit"|nc {server_to} {port_to} -t -w 1s'
+        action_for_sending = build_remote_pipeline([
+            ('printf', ['%s', 'exit']),
+            ('nc', arguments),
+        ])
         output = server_mod.ssh_command(server_from, action_for_sending, raw=1)
+        output = _text_lines(output)
 
     if stderr != '':
         return f'error: <b>{stderr[5:]}</b>'
@@ -85,13 +106,21 @@ def nslookup_from_server(server_from: str, dns_name: str, record_type: str) -> s
 
     if dns_name == '':
         return 'warning: enter a correct DNS name'
+    if not record_type:
+        return 'warning: choose a DNS record type'
 
-    action_for_sending = f'dig {dns_name} {record_type} |grep -e "SERVER\|{dns_name}"'
+    arguments = [dns_name, record_type]
 
     if server_from == 'localhost':
-        output, stderr = server_mod.subprocess_execute(action_for_sending)
+        result = run_local(['dig', *arguments], timeout=10)
+        output = result.stdout_lines
+        stderr = result.stderr
     else:
-        output = server_mod.ssh_command(server_from, action_for_sending, raw=1)
+        command = build_remote_command('dig', arguments)
+        output = server_mod.ssh_command(server_from, command, raw=1)
+        output = _text_lines(output)
+
+    output = [line for line in output if 'SERVER' in line or dns_name in line]
 
     if stderr != '':
         return 'error: ' + stderr[5:-1]

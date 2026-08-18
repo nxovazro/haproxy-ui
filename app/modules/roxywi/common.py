@@ -359,6 +359,11 @@ def is_user_has_access_to_group(user_id: int, group_id: int) -> None:
 
 def require_active_group_access(group_id: int) -> None:
 	"""Require a resource to belong to the group selected in the current token."""
+	# Role 1 is the global administrator. The admin page intentionally lists
+	# resources from every group for this role, so its follow-up AJAX requests
+	# must use the same authorization rule.
+	if str(g.user_params.get('role', '')) == '1':
+		return
 	if int(group_id) != int(g.user_params['group_id']):
 		raise RoxywiGroupMismatch
 

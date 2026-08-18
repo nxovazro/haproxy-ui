@@ -1,12 +1,12 @@
 """Build an NGINX virtual server -> location -> upstream -> server graph."""
 
 import ipaddress
-import shlex
 
 import app.modules.db.server as server_sql
 import app.modules.db.service as service_sql
 import app.modules.db.sql as sql
 import app.modules.server.server as server_mod
+from app.modules.server.command import build_remote_command
 
 
 _PASS_DIRECTIVES = {'proxy_pass', 'fastcgi_pass', 'uwsgi_pass', 'scgi_pass', 'grpc_pass'}
@@ -298,9 +298,11 @@ def show_map(serv: str, group_id: int) -> dict:
         container_name = sql.get_setting('nginx_container_name', group_id=group_id)
         if not container_name:
             raise RuntimeError('NGINX container name is not configured')
-        command = f'sudo docker exec {shlex.quote(str(container_name))} nginx -T 2>&1'
+        command = build_remote_command(
+            'docker', ['exec', container_name, 'nginx', '-T'], sudo=True, merge_stderr=True
+        )
     else:
-        command = 'sudo nginx -T 2>&1'
+        command = build_remote_command('nginx', ['-T'], sudo=True, merge_stderr=True)
 
     config_text = server_mod.ssh_command(serv, command, timeout=20, rc=True)
     if not config_text or not config_text.strip():

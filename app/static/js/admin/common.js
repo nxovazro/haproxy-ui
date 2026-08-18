@@ -2,6 +2,9 @@ $( function() {
     $("#tabs ul li").click(function () {
         let activeTab = $(this).find("a").attr("href");
         let activeTabClass = activeTab.replace('#', '');
+        if (activeTab && activeTab.startsWith('#')) {
+            window.history.replaceState(null, '', window.location.pathname + window.location.search + activeTab);
+        }
         $('.menu li ul li').each(function () {
             activeSubMenu($(this), activeTabClass)
         });

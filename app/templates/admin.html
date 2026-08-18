@@ -22,6 +22,9 @@
         <li><a href="#groups" title="{{lang.words.admin_area|title()}}: {{lang.words.manage|title()}} {{lang.words.groups}} - Roxy-WI">{{lang.words.groups|title()}}</a></li>
 		<li><a href="#tools" title="{{lang.words.admin_area|title()}}: {{lang.words.manage|title()}} Roxy-WI {{lang.words.tools}} - Roxy-WI">{{lang.words.tools|title()}}</a></li>
 		<li><a href="#updatehapwi" title="{{lang.words.admin_area|title()}}: {{lang.words.w_update|title()}} Roxy-WI - Roxy-WI">{{lang.words.w_update|title()}}</a></li>
+		{% if oidc_available %}
+		<li><a href="#oidc" title="Manage OpenID Connect login providers">OIDC</a></li>
+		{% endif %}
         {% endif %}
 	</ul>
 	<div id="users">
@@ -135,6 +138,12 @@
 		</div>
 		<div id="ajax-update"></div>
 	</div>
+
+	{% if oidc_available %}
+		<div id="oidc">
+			{% include 'include/admin_oidc.html' %}
+		</div>
+	{% endif %}
 
     {% endif %}
 </div>

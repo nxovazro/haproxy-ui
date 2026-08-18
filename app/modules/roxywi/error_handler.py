@@ -53,6 +53,15 @@ ERROR_MESSAGE_MAPPING = {
 }
 
 
+def _wants_json_response() -> bool:
+    """Return JSON errors for API and XMLHttpRequest clients, HTML for page loads."""
+    return (
+        request.path.startswith('/api/')
+        or request.headers.get('X-Requested-With') == 'XMLHttpRequest'
+        or request.accept_mimetypes.best == 'application/json'
+    )
+
+
 def log_error(exception: Exception, server_ip: str = "Roxy-WI server", 
               additional_info: str = "", keep_history: bool = False, 
               service: str = None) -> None:
@@ -181,7 +190,7 @@ def register_error_handlers(app):
     @app.errorhandler(401)
     def unauthorized(e):
         """Handle 401 Unauthorized errors."""
-        if request.path.startswith('/api/'):
+        if _wants_json_response():
             return jsonify(ErrorResponse(error=str(e)).model_dump(mode='json')), 401
         return redirect(url_for('login_page', next=request.full_path))
 
@@ -189,7 +198,7 @@ def register_error_handlers(app):
     @get_user_params()
     def forbidden(e):
         """Handle 403 Forbidden errors."""
-        if request.path.startswith('/api/'):
+        if _wants_json_response():
             return jsonify(ErrorResponse(error=str(e)).model_dump(mode='json')), 403
 
         kwargs = {
@@ -203,7 +212,7 @@ def register_error_handlers(app):
     @get_user_params()
     def not_found(e):
         """Handle 404 Not Found errors."""
-        if request.path.startswith('/api/'):
+        if _wants_json_response():
             return jsonify(ErrorResponse(error=str(e)).model_dump(mode='json')), 404
 
         kwargs = {
@@ -232,7 +241,7 @@ def register_error_handlers(app):
     @get_user_params()
     def internal_server_error(e):
         """Handle 500 Internal Server Error errors."""
-        if request.path.startswith('/api/'):
+        if _wants_json_response():
             return jsonify(ErrorResponse(error=str(e)).model_dump(mode='json')), 500
 
         kwargs = {

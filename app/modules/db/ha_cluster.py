@@ -30,6 +30,8 @@ def select_cluster(cluster_id: int):
 def get_cluster(cluster_id: int):
 	try:
 		return HaCluster.get(HaCluster.id == cluster_id)
+	except HaCluster.DoesNotExist:
+		raise RoxywiResourceNotFound(f'HA cluster {cluster_id} not found')
 	except Exception as e:
 		out_error(e)
 

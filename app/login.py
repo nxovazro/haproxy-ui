@@ -1,9 +1,11 @@
-from flask import render_template, request, redirect, make_response, abort
+from flask import render_template, request, redirect, make_response, abort, g
 from flask_jwt_extended import get_jwt, unset_jwt_cookies, jwt_required
 
 from app import app
 import app.modules.db.user as user_sql
 import app.modules.db.token as token_sql
+import app.modules.db.oidc as oidc_sql
+from app.modules.oidc.access import is_oidc_available
 import app.modules.roxywi.roxy as roxy
 import app.modules.roxywi.auth as roxywi_auth
 import app.modules.roxywi.common as roxywi_common
@@ -12,10 +14,25 @@ from app.modules.roxywi import logger
 from app.modules.roxywi.exception import RoxywiResourceNotFound
 
 
+@app.context_processor
+def inject_oidc_availability():
+    user_params = getattr(g, 'user_params', None)
+    if not user_params or not user_params.get('user'):
+        return {'oidc_available': False}
+
+    oidc_available = getattr(g, 'oidc_available', None)
+    if oidc_available is None:
+        oidc_available = is_oidc_available()
+        g.oidc_available = oidc_available
+
+    return {'oidc_available': oidc_available}
+
+
 @app.before_request
 def check_login():
     allowed_endpoints = (
-        'login_page', 'api.do_login', 'static', 'main.get_version', 'service.check_service', 'smon.show_smon_status_page',
+        'login_page', 'api.do_login', 'oidc.public_providers', 'oidc.oidc_login', 'oidc.oidc_callback',
+        'static', 'main.get_version', 'service.check_service', 'smon.show_smon_status_page',
         'smon.smon_history_statuses', 'smon.agent_get_checks', 'smon.get_check_status', 'favicon'
     )
     if request.endpoint not in allowed_endpoints:
@@ -56,8 +73,9 @@ def redirect_to_login(response):
 def login_page():
     if request.method == 'GET':
         lang = roxywi_common.get_user_lang_for_flask()
+        oidc_providers = oidc_sql.list_providers(enabled_only=True) if is_oidc_available() else []
 
-        return render_template('login.html', lang=lang)
+        return render_template('login.html', lang=lang, oidc_providers=oidc_providers)
     elif request.method == 'POST':
         next_url = request.json.get('next')
         login = checkAjaxInput(request.json.get('login'))

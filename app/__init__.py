@@ -61,6 +61,7 @@ from app.routes.runtime import bp as runtime_bp
 from app.routes.user import bp as user_bp
 from app.routes.smon import bp as smon_bp
 from app.api.routes import bp as api_bp
+from app.routes.oidc import bp as oidc_bp
 
 app.register_blueprint(main_bp)
 app.register_blueprint(overview_bp)
@@ -71,6 +72,7 @@ app.register_blueprint(runtime_bp, url_prefix='/runtimeapi')
 app.register_blueprint(user_bp, url_prefix='/user')
 app.register_blueprint(smon_bp, url_prefix='/smon')
 app.register_blueprint(api_bp, url_prefix='/api')
+app.register_blueprint(oidc_bp, url_prefix='/oidc')
 
 if app.config['TESTING']:
     # Register security-sensitive legacy blueprints in unit tests as well.

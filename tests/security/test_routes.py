@@ -71,6 +71,53 @@ def test_nginx_dependency_map_is_not_public(client):
 
 
 @pytest.mark.security
+def test_unauthenticated_ajax_request_gets_json_instead_of_login_redirect(client):
+    response = client.get(
+        '/config/map/haproxy/192.0.2.10/show',
+        headers={'X-Requested-With': 'XMLHttpRequest'},
+    )
+
+    assert response.status_code == 401
+    assert response.is_json
+    assert response.get_json()['error']
+
+
+@pytest.mark.security
+def test_forbidden_ajax_request_gets_json_error(app, client):
+    with app.app_context():
+        token = create_access_token('1', additional_claims={'group': '1'})
+    response = client.get(
+        '/runtimeapi/backends/999999',
+        headers={
+            'Authorization': f'Bearer {token}',
+            'X-Requested-With': 'XMLHttpRequest',
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.is_json
+    assert 'active group' in response.get_json()['error']
+
+
+@pytest.mark.security
+def test_config_versions_page_does_not_require_server_ip(app, client, monkeypatch):
+    monkeypatch.setattr(
+        'app.routes.config.routes.render_template',
+        lambda template, **kwargs: f'{template}:{kwargs["serv"]}',
+    )
+    with app.app_context():
+        token = create_access_token('1', additional_claims={'group': '1'})
+
+    response = client.get(
+        '/config/versions/haproxy',
+        headers={'Authorization': f'Bearer {token}'},
+    )
+
+    assert response.status_code == 200
+    assert response.get_data(as_text=True) == 'delver.html:'
+
+
+@pytest.mark.security
 def test_logout_revokes_bearer_token(app, client):
     with app.app_context():
         token = create_access_token('1', additional_claims={'group': '1'})

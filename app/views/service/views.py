@@ -1,6 +1,7 @@
 import os
 from typing import Union, Literal
 
+import requests
 from flask.views import MethodView
 from flask_pydantic import validate
 from flask import jsonify, g
@@ -174,21 +175,35 @@ class ServiceView(MethodView):
             apache_stats_password = sql.get_setting('apache_stats_password')
             apache_stats_port = sql.get_setting('apache_stats_port')
             apache_stats_page = sql.get_setting('apache_stats_page')
-            cmd = "curl -s -u %s:%s http://%s:%s/%s?auto |grep 'ServerVersion\|Processes\|ServerUptime:'" % \
-                  (apache_stats_user, apache_stats_password, server.ip, apache_stats_port, apache_stats_page)
-            servers_with_status = list()
             try:
-                out = server_mod.subprocess_execute(cmd)
-                if out != '':
-                    for k in out:
-                        servers_with_status.append(k)
+                stats_url = (
+                    f'http://{server.ip}:{int(apache_stats_port)}/'
+                    f'{str(apache_stats_page).lstrip("/")}?auto'
+                )
+                response = requests.get(
+                    stats_url,
+                    auth=(apache_stats_user, apache_stats_password),
+                    timeout=5,
+                )
+                response.raise_for_status()
+
+                stats = {}
+                for line in response.text.splitlines():
+                    key, separator, value = line.partition(':')
+                    if separator and key in {'ServerVersion', 'ServerUptime', 'Processes'}:
+                        stats[key] = value.strip()
+
+                version = stats.get('ServerVersion', '')
+                if '/' in version:
+                    version = version.split('/', 1)[1].split(' ', 1)[0]
+                process_count = stats.get('Processes', '0')
                 data = {
-                    "Version": servers_with_status[0][0].split('/')[1].split(' ')[0],
-                    "Uptime": servers_with_status[0][1].split(':')[1].strip(),
-                    "Process": servers_with_status[0][2].split(' ')[1],
-                    "status": self._service_status(servers_with_status[0][2].split(' ')[1])
+                    "Version": version,
+                    "Uptime": stats.get('ServerUptime', ''),
+                    "Process": process_count,
+                    "status": self._service_status(process_count),
                 }
-            except IndexError:
+            except (requests.RequestException, ValueError):
                 data = {
                     "Version": '',
                     "Uptime": '',

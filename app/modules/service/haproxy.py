@@ -8,6 +8,7 @@ from requests.exceptions import ConnectionError, Timeout
 
 import app.modules.db.sql as sql
 import app.modules.server.server as server_mod
+from app.modules.server.command import build_remote_command
 import app.modules.config.config as config_mod
 import app.modules.roxywi.common as roxywi_common
 
@@ -192,11 +193,16 @@ def show_map(serv: str, group_id: int) -> dict:
 def runtime_command(serv: str, enable: str, backend: str, save: str) -> str:
     server_state_file = sql.get_setting('server_state_file', group_id=g.user_params['group_id'])
     haproxy_sock = sql.get_setting('haproxy_sock', group_id=g.user_params['group_id'])
-    cmd = f"echo {enable} {backend} |sudo socat stdio {haproxy_sock}"
+    runtime_line = f'{enable} {backend}'.strip()
+    send_command = build_remote_command('printf', ['%s\\n', runtime_line])
+    socket_command = build_remote_command('socat', ['stdio', haproxy_sock], sudo=True)
+    cmd = f'{send_command} | {socket_command}'
 
     if save == "on":
-        save_command = f'echo "show servers state" | sudo socat {haproxy_sock} stdio > {server_state_file}'
-        cmd = cmd + ';' + save_command
+        show_state_command = build_remote_command('printf', ['%s\\n', 'show servers state'])
+        read_socket_command = build_remote_command('socat', [haproxy_sock, 'stdio'], sudo=True)
+        save_state_command = f'{build_remote_command("tee", [server_state_file], sudo=True)} > /dev/null'
+        cmd = f'{cmd}; {show_state_command} | {read_socket_command} | {save_state_command}'
 
     try:
         output = server_mod.ssh_command(serv, cmd, show_log="1")

@@ -1,4 +1,6 @@
 import json
+from pathlib import Path
+import re
 
 from flask import render_template, jsonify
 
@@ -6,61 +8,177 @@ import app.modules.db.sql as sql
 import app.modules.db.server as server_sql
 import app.modules.config.config as config_mod
 import app.modules.config.common as config_common
-import app.modules.config.section as section_mod
-import app.modules.server.server as server_mod
+from app.modules.service.haproxy_runtime import execute_runtime_command
 import app.modules.roxywi.common as roxywi_common
 import app.modules.roxy_wi_tools as roxy_wi_tools
 
 get_config_var = roxy_wi_tools.GetConfigVar()
 
 
+def _runtime_command(server: str, port: int, command: str) -> tuple[list[str], str]:
+	try:
+		response = execute_runtime_command(server, int(port), command)
+	except Exception as exception:
+		return [''], str(exception)
+	lines = response.splitlines()
+	return lines or [''], ''
+
+
+_SECTION_NAMES = {
+	'global', 'listen', 'frontend', 'backend', 'cache', 'defaults', 'peers',
+	'resolvers', 'userlist', 'http-errors', 'log-forward',
+}
+
+
+def _read_config_lines(config_path: str) -> list[str]:
+	return Path(config_path).read_text(encoding='utf-8', errors='replace').splitlines(keepends=True)
+
+
+def _write_config_lines(config_path: str, lines: list[str]) -> None:
+	Path(config_path).write_text(''.join(lines), encoding='utf-8')
+
+
+def _find_section(lines: list[str], section_types, section_name: str = '') -> tuple[int, int]:
+	if isinstance(section_types, str):
+		section_types = (section_types,)
+	for start, line in enumerate(lines):
+		parts = line.strip().split()
+		if not parts or parts[0] not in section_types:
+			continue
+		if section_name and (len(parts) < 2 or parts[1] != section_name):
+			continue
+		for end in range(start + 1, len(lines)):
+			candidate = lines[end].strip().split()
+			if candidate and candidate[0] in _SECTION_NAMES:
+				return start, end
+		return start, len(lines)
+	raise RuntimeError(f'Cannot find configuration section: {section_name or "/".join(section_types)}')
+
+
+def _replace_server_address(config_path: str, backend: str, server: str, address: str, port: int) -> None:
+	lines = _read_config_lines(config_path)
+	start, end = _find_section(lines, ('backend', 'listen'), backend)
+	server_pattern = re.compile(rf'^(\s*server\s+{re.escape(server)}\s+)\S+(.*)$')
+	for index in range(start + 1, end):
+		match = server_pattern.match(lines[index].rstrip('\r\n'))
+		if match:
+			newline = '\n' if lines[index].endswith('\n') else ''
+			lines[index] = f'{match.group(1)}{address}:{port}{match.group(2)}{newline}'
+			_write_config_lines(config_path, lines)
+			return
+	raise RuntimeError(f'Cannot find server {backend}/{server} in configuration')
+
+
+def _insert_server(config_path: str, backend: str, server_line: str) -> None:
+	lines = _read_config_lines(config_path)
+	_start, end = _find_section(lines, ('backend', 'listen'), backend)
+	lines.insert(end, f'    {server_line.rstrip()}\n')
+	_write_config_lines(config_path, lines)
+
+
+def _delete_server(config_path: str, backend: str, server: str) -> None:
+	lines = _read_config_lines(config_path)
+	start, end = _find_section(lines, ('backend', 'listen'), backend)
+	server_pattern = re.compile(rf'^\s*server\s+{re.escape(server)}(?:\s|$)')
+	for index in range(start + 1, end):
+		if server_pattern.match(lines[index]):
+			del lines[index]
+			_write_config_lines(config_path, lines)
+			return
+	raise RuntimeError(f'Cannot find server {backend}/{server} in configuration')
+
+
+def _set_section_maxconn(config_path: str, section_type: str, section_name: str, maxconn: int) -> None:
+	lines = _read_config_lines(config_path)
+	start, end = _find_section(lines, section_type, section_name)
+	maxconn_pattern = re.compile(r'^(\s*maxconn\s+)\d+(.*)$')
+	for index in range(start + 1, end):
+		match = maxconn_pattern.match(lines[index].rstrip('\r\n'))
+		if match:
+			newline = '\n' if lines[index].endswith('\n') else ''
+			lines[index] = f'{match.group(1)}{maxconn}{match.group(2)}{newline}'
+			_write_config_lines(config_path, lines)
+			return
+	lines.insert(end, f'    maxconn {maxconn}\n')
+	_write_config_lines(config_path, lines)
+
+
+def _set_server_maxconn(config_path: str, backend: str, server: str, maxconn: int) -> None:
+	lines = _read_config_lines(config_path)
+	start, end = _find_section(lines, ('backend', 'listen'), backend)
+	server_pattern = re.compile(rf'^(\s*server\s+{re.escape(server)}\s+\S+)(.*)$')
+	for index in range(start + 1, end):
+		line = lines[index].rstrip('\r\n')
+		match = server_pattern.match(line)
+		if not match:
+			continue
+		options = match.group(2)
+		if re.search(r'\bmaxconn\s+\d+', options):
+			options = re.sub(r'\bmaxconn\s+\d+', f'maxconn {maxconn}', options, count=1)
+		else:
+			options = f'{options.rstrip()} maxconn {maxconn}'
+		newline = '\n' if lines[index].endswith('\n') else ''
+		lines[index] = f'{match.group(1)}{options}{newline}'
+		_write_config_lines(config_path, lines)
+		return
+	raise RuntimeError(f'Cannot find server {backend}/{server} in configuration')
+
+
+def _list_file_path(lib_path: str, user_group: int, list_name: str) -> Path:
+	base_path = (Path(lib_path) / 'lists' / str(user_group)).resolve()
+	list_path = (base_path / list_name).resolve()
+	if list_path == base_path or base_path not in list_path.parents:
+		raise ValueError('List file is outside of the group directory')
+	return list_path
+
+
 def show_frontend_backend(serv: str, backend: str) -> str:
 	haproxy_sock_port = int(sql.get_setting('haproxy_sock_port'))
-	cmd = 'echo "show servers state"|nc %s %s |grep "%s" |awk \'{print $4}\'' % (serv, haproxy_sock_port, backend)
-	output, stderr = server_mod.subprocess_execute(cmd)
+	output, _stderr = _runtime_command(serv, haproxy_sock_port, 'show servers state')
 	lines = ''
-	for i in output:
-		if i == ' ':
+	for line in output:
+		if backend not in line:
 			continue
-		i = i.strip()
-		lines += i + '<br>'
+		fields = line.split()
+		if len(fields) > 3:
+			lines += fields[3] + '<br>'
 	return lines
 
 
 def show_server(serv: str, backend: str, backend_server: str) -> str:
 	haproxy_sock_port = int(sql.get_setting('haproxy_sock_port'))
-	cmd = 'echo "show servers state"|nc %s %s |grep "%s" |grep "%s" |awk \'{print $5":"$19}\' |head -1' % (
-		serv, haproxy_sock_port, backend, backend_server)
-	output, stderr = server_mod.subprocess_execute(cmd)
-	return output[0]
+	output, _stderr = _runtime_command(serv, haproxy_sock_port, 'show servers state')
+	for line in output:
+		if backend not in line or backend_server not in line:
+			continue
+		fields = line.split()
+		if len(fields) > 18:
+			return f'{fields[4]}:{fields[18]}'
+	return ''
 
 
 def get_all_stick_table(serv: str):
 	hap_sock_p = sql.get_setting('haproxy_sock_port')
-	cmd = 'echo "show table"|nc %s %s |awk \'{print $3}\' | tr -d \'\n\' | tr -d \'[:space:]\'' % (serv, hap_sock_p)
-	output, stderr = server_mod.subprocess_execute(cmd)
-	return output[0]
+	output, _stderr = _runtime_command(serv, hap_sock_p, 'show table')
+	return ''.join(line.split()[2] for line in output if len(line.split()) > 2)
 
 
 def get_stick_table(serv: str, table: str):
 	hap_sock_p = sql.get_setting('haproxy_sock_port')
-	cmd = 'echo "show table %s"|nc %s %s |awk -F"#" \'{print $2}\' |head -1 | tr -d \'\n\'' % (table, serv, hap_sock_p)
-	output, stderr = server_mod.subprocess_execute(cmd)
+	output, _stderr = _runtime_command(serv, hap_sock_p, f'show table {table}')
+	header = next((line.split('#', 1)[1] for line in output if '#' in line), '')
 	tables_head = []
-	for i in output[0].split(','):
-		i = i.split(':')[1]
-		tables_head.append(i)
-
-	cmd = 'echo "show table %s"|nc %s %s |grep -v "#"' % (table, serv, hap_sock_p)
-	output, stderr = server_mod.subprocess_execute(cmd)
+	for item in header.split(','):
+		if ':' in item:
+			tables_head.append(item.split(':', 1)[1])
+	output = [line for line in output if '#' not in line]
 
 	return tables_head, output
 
 
 def show_backends(server_ip, **kwargs):
 	hap_sock_p = sql.get_setting('haproxy_sock_port')
-	cmd = f'echo "show backend" |nc {server_ip} {hap_sock_p}'
-	output, stderr = server_mod.subprocess_execute(cmd)
+	output, stderr = _runtime_command(server_ip, hap_sock_p, 'show backend')
 	lines = ''
 	if stderr:
 		roxywi_common.logging('Roxy-WI server', ' ' + stderr, roxywi=1)
@@ -126,35 +244,31 @@ def change_ip_and_port(serv, backend_backend, backend_server, backend_ip, backen
 
 	for master in masters:
 		if master[0] is not None:
-			cmd = (f'echo "set server {backend_backend}/{backend_server} addr {backend_ip} port {backend_port} '
-				   f'check-port {backend_port}" |nc {master[0]} {sock_port}')
-			output, stderr = server_mod.subprocess_execute(cmd)
+			command = (f'set server {backend_backend}/{backend_server} addr {backend_ip} port {backend_port} '
+					   f'check-port {backend_port}')
+			output, stderr = _runtime_command(master[0], sock_port, command)
 			lines += output[0]
 			roxywi_common.logging(
 				master[0], f'IP address and port have been changed. On: {backend_backend}/{backend_server} to {backend_ip}:{backend_port}',
 				keep_history=1, service='haproxy'
 			)
 
-	cmd = f'echo "set server {backend_backend}/{backend_server} addr {backend_ip} port {backend_port} ' \
-		  f'check-port {backend_port}" |nc {serv} {sock_port}'
+	command = f'set server {backend_backend}/{backend_server} addr {backend_ip} port {backend_port} check-port {backend_port}'
 	roxywi_common.logging(
 		serv,
 		f'IP address and port have been changed. On: {backend_backend}/{backend_server} to {backend_ip}:{backend_port}',
 		keep_history=1, service='haproxy'
 	)
-	output, stderr = server_mod.subprocess_execute(cmd)
+	output, stderr = _runtime_command(serv, sock_port, command)
 
 	if stderr != '':
-		return 'error: ' + stderr[0]
+		return f'error: {stderr}'
 
 	lines += output[0]
 	cfg = config_common.generate_config_path('haproxy', serv)
 
 	config_mod.get_config(serv, cfg)
-	cmd = 'string=`grep %s %s -n -A25 |grep "server %s" |head -1|awk -F"-" \'{print $1}\'` ' \
-		  '&& sed -Ei "$(echo $string)s/((1?[0-9][0-9]?|2[0-4][0-9]|25[0-5])\.){3}(1?[0-9][0-9]?|2[0-4][0-9]|25[0-5]):[0-9]+/%s:%s/g" %s' % \
-		  (backend_backend, cfg, backend_server, backend_ip, backend_port, cfg)
-	server_mod.subprocess_execute(cmd)
+	_replace_server_address(cfg, backend_backend, backend_server, backend_ip, backend_port)
 	config_mod.master_slave_upload_and_restart(serv, cfg, 'save', 'haproxy')
 
 	return lines
@@ -171,18 +285,16 @@ def add_server_via_runtime(
 	if check:
 		check_cmd = 'check'
 
-	commands = [
-		f'echo "add server {backend}/{server} {backend_ip}:{backend_port} {check_cmd}"|nc {server_ip} {sock_port}',
-	]
+	commands = [f'add server {backend}/{server} {backend_ip}:{backend_port} {check_cmd}'.rstrip()]
 
 	if check:
-		commands.append(f'echo "enable health {backend}/{server}"|nc {server_ip} {sock_port}')
-		commands.append(f'echo "set server {backend}/{server} check-addr {server_ip} check-port {port_check}"|nc {server_ip} {sock_port}')
+		commands.append(f'enable health {backend}/{server}')
+		commands.append(f'set server {backend}/{server} check-addr {backend_ip} check-port {port_check}')
 
-	commands.append(f'echo "set server {backend}/{server} state ready"|nc {server_ip} {sock_port}')
+	commands.append(f'set server {backend}/{server} state ready')
 
-	for cmd in commands:
-		output, stderr = server_mod.subprocess_execute(cmd)
+	for command in commands:
+		output, stderr = _runtime_command(server_ip, sock_port, command)
 		lines += output[0]
 	return lines, stderr
 
@@ -193,12 +305,12 @@ def delete_server_via_runtime(server_ip: str, backend: str, server: str) -> tupl
 	sock_port = sql.get_setting('haproxy_sock_port')
 
 	commands = [
-		f'echo "set server {backend}/{server} state maint"|nc {server_ip} {sock_port}',
-		f'echo "del server {backend}/{server} "|nc {server_ip} {sock_port}',
+		f'set server {backend}/{server} state maint',
+		f'del server {backend}/{server}',
 	]
 
-	for cmd in commands:
-		output, stderr = server_mod.subprocess_execute(cmd)
+	for command in commands:
+		output, stderr = _runtime_command(server_ip, sock_port, command)
 		lines += output[0]
 	return lines, stderr
 
@@ -242,17 +354,8 @@ def add_server(
 		config_mod.get_config(server_ip, cfg)
 	except Exception as e:
 		raise Exception(f'error: Cannot config section: {e}')
-	section_name_cmd = f'grep {backend} {cfg}'
-	section_name = server_mod.subprocess_execute(section_name_cmd)
-
-	try:
-		start_line, end_line, return_config = section_mod.get_section_from_config(cfg, section_name[0][0])
-	except Exception as e:
-		raise Exception(f'error: Cannot get config section: {e}')
-	new_end_line = int(end_line) + 1
-	new_server_cfg = f'\    \server {backend_ip} {backend_ip}:{backend_port} {check_cfg}'
-	cmd = f"sed -i '{new_end_line} i {new_server_cfg}' {cfg}"
-	server_mod.subprocess_execute(cmd)
+	new_server_cfg = f'server {server} {backend_ip}:{backend_port} {check_cfg}'
+	_insert_server(cfg, backend, new_server_cfg)
 	try:
 		config_mod.master_slave_upload_and_restart(server_ip, cfg, 'save', 'haproxy')
 	except Exception as e:
@@ -283,7 +386,7 @@ def delete_server(server_ip: str, backend: str, server: str) -> str:
 	)
 
 	if stderr != '':
-		return 'error: ' + stderr[0]
+		return f'error: {stderr}'
 
 	if 'No such server' in lines:
 		return f'error: {lines}'
@@ -291,8 +394,7 @@ def delete_server(server_ip: str, backend: str, server: str) -> str:
 	cfg = config_common.generate_config_path('haproxy', server_ip)
 
 	config_mod.get_config(server_ip, cfg)
-	cmd = f'string=`grep {backend} {cfg} -n -A25 |grep "server {server}" |head -1|awk -F"-" \'{{print $1}}\'` && sed -i "$(echo $string)d" {cfg}'
-	server_mod.subprocess_execute(cmd)
+	_delete_server(cfg, backend, server)
 	config_mod.master_slave_upload_and_restart(server_ip, cfg, 'save', 'haproxy')
 
 	return lines
@@ -307,23 +409,19 @@ def change_maxconn_global(serv: str, maxconn: int) -> str:
 
 	for master in masters:
 		if master[0] is not None:
-			cmd = f'echo "set maxconn global {maxconn}" |nc {master[0]} {haproxy_sock_port}'
-			server_mod.subprocess_execute(cmd)
+			_runtime_command(master[0], haproxy_sock_port, f'set maxconn global {maxconn}')
 		roxywi_common.logging(master[0], f'Maxconn has been changed. Globally to {maxconn}', keep_history=1, service='haproxy')
 
-	cmd = f'echo "set maxconn global {maxconn}" |nc {serv} {haproxy_sock_port}'
 	roxywi_common.logging(serv, f'Maxconn has been changed. Globally to {maxconn}', keep_history=1, service='haproxy')
-	output, stderr = server_mod.subprocess_execute(cmd)
+	output, stderr = _runtime_command(serv, haproxy_sock_port, f'set maxconn global {maxconn}')
 
 	if stderr != '':
-		return stderr[0]
+		return stderr
 	elif output[0] == '':
 		cfg = config_common.generate_config_path('haproxy', serv)
 
 		config_mod.get_config(serv, cfg)
-		cmd = 'string=`grep global %s -n -A5 |grep maxcon -n |awk -F":" \'{print $2}\'|awk -F"-" \'{print $1}\'` ' \
-			  '&& sed -Ei "$( echo $string)s/[0-9]+/%s/g" %s' % (cfg, maxconn, cfg)
-		server_mod.subprocess_execute(cmd)
+		_set_section_maxconn(cfg, 'global', '', maxconn)
 		config_mod.master_slave_upload_and_restart(serv, cfg, 'save', 'haproxy')
 		return f'success: Maxconn globally has been set to {maxconn} '
 	else:
@@ -339,23 +437,19 @@ def change_maxconn_frontend(serv, maxconn, frontend) -> str:
 
 	for master in masters:
 		if master[0] is not None:
-			cmd = f'echo "set maxconn frontend {frontend} {maxconn}" |nc {master[0]} {haproxy_sock_port}'
-			server_mod.subprocess_execute(cmd)
+			_runtime_command(master[0], haproxy_sock_port, f'set maxconn frontend {frontend} {maxconn}')
 		roxywi_common.logging(master[0], f'Maxconn has been changed. On: {frontend} to {maxconn}', keep_history=1, service='haproxy')
 
-	cmd = f'echo "set maxconn frontend {frontend} {maxconn}" |nc {serv} {haproxy_sock_port}'
 	roxywi_common.logging(serv, f'Maxconn has been changed. On: {frontend} to {maxconn}', keep_history=1, service='haproxy')
-	output, stderr = server_mod.subprocess_execute(cmd)
+	output, stderr = _runtime_command(serv, haproxy_sock_port, f'set maxconn frontend {frontend} {maxconn}')
 
 	if stderr != '':
-		return stderr[0]
+		return stderr
 	elif output[0] == '':
 		cfg = config_common.generate_config_path('haproxy', serv)
 
 		config_mod.get_config(serv, cfg)
-		cmd = 'string=`grep %s %s -n -A5 |grep maxcon -n |awk -F":" \'{print $2}\'|awk -F"-" \'{print $1}\'` ' \
-			  '&& sed -Ei "$( echo $string)s/[0-9]+/%s/g" %s' % (frontend, cfg, maxconn, cfg)
-		server_mod.subprocess_execute(cmd)
+		_set_section_maxconn(cfg, 'frontend', frontend, maxconn)
 		config_mod.master_slave_upload_and_restart(serv, cfg, 'save', 'haproxy')
 		return f'success: Maxconn for {frontend} has been set to {maxconn} '
 	else:
@@ -371,23 +465,19 @@ def change_maxconn_backend(serv, backend, backend_server, maxconn) -> str:
 	masters = server_sql.is_master(serv)
 	for master in masters:
 		if master[0] is not None:
-			cmd = f'echo "set maxconn server {backend}/{backend_server} {maxconn}" |nc {master[0]} {haproxy_sock_port}'
-			server_mod.subprocess_execute(cmd)
+			_runtime_command(master[0], haproxy_sock_port, f'set maxconn server {backend}/{backend_server} {maxconn}')
 		roxywi_common.logging(master[0], f'Maxconn has been changed. On: {backend}/{backend_server} to {maxconn}', keep_history=1, service='haproxy')
 
-	cmd = f'echo "set maxconn server {backend}/{backend_server} {maxconn}" |nc {serv} {haproxy_sock_port}'
 	roxywi_common.logging(serv, f'Maxconn has been changed. On: {backend} to {maxconn}', keep_history=1, service='haproxy')
-	output, stderr = server_mod.subprocess_execute(cmd)
+	output, stderr = _runtime_command(serv, haproxy_sock_port, f'set maxconn server {backend}/{backend_server} {maxconn}')
 
 	if stderr != '':
-		return stderr[0]
+		return stderr
 	elif output[0] == '':
 		cfg = config_common.generate_config_path('haproxy', serv)
 
 		config_mod.get_config(serv, cfg)
-		cmd = 'string=`grep %s %s -n -A10 |grep maxcon -n|grep %s |awk -F":" \'{print $2}\'|awk -F"-" \'{print $1}\'` ' \
-			  '&& sed -Ei "$( echo $string)s/maxconn [0-9]+/maxconn %s/g" %s' % (backend, cfg, backend_server, maxconn, cfg)
-		server_mod.subprocess_execute(cmd)
+		_set_server_maxconn(cfg, backend, backend_server, maxconn)
 		config_mod.master_slave_upload_and_restart(serv, cfg, 'save', 'haproxy')
 		return f'success: Maxconn for {backend}/{backend_server} has been set to {maxconn} '
 	else:
@@ -417,37 +507,35 @@ def table_select(serv: str, table: str):
 def delete_ip_from_stick_table(serv, ip, table) -> str:
 	haproxy_sock_port = sql.get_setting('haproxy_sock_port')
 
-	cmd = f'echo "clear table {table} key {ip}" |nc {serv} {haproxy_sock_port}'
-	output, stderr = server_mod.subprocess_execute(cmd)
+	_output, stderr = _runtime_command(serv, haproxy_sock_port, f'clear table {table} key {ip}')
 	if stderr != '':
-		return f'error: {stderr[0]}'
+		return f'error: {stderr}'
 	return 'ok'
 
 
 def clear_stick_table(serv, table) -> str:
 	haproxy_sock_port = sql.get_setting('haproxy_sock_port')
 
-	cmd = f'echo "clear table {table} " |nc {serv} {haproxy_sock_port}'
-	output, stderr = server_mod.subprocess_execute(cmd)
+	_output, stderr = _runtime_command(serv, haproxy_sock_port, f'clear table {table}')
 	if stderr != '':
-		return f'error: {stderr[0]}'
+		return f'error: {stderr}'
 	return 'ok'
 
 
 def list_of_lists(serv) -> dict:
 	haproxy_sock_port = sql.get_setting('haproxy_sock_port')
-	cmd = f'echo "show acl"|nc {serv} {haproxy_sock_port} |grep "loaded from" |awk \'{{print $1,$2}}\''
-	output, stderr = server_mod.subprocess_execute(cmd)
-	acl_lists = []
-	for i in output:
-		acl_lists.append(i)
+	output, _stderr = _runtime_command(serv, haproxy_sock_port, 'show acl')
+	acl_lists = [
+		' '.join(line.split()[:2])
+		for line in output
+		if 'loaded from' in line
+	]
 	return jsonify(acl_lists)
 
 
 def show_lists(serv, list_id, color, list_name) -> str:
 	haproxy_sock_port = sql.get_setting('haproxy_sock_port')
-	cmd = f'echo "show acl #{list_id}"|nc {serv} {haproxy_sock_port}'
-	output, stderr = server_mod.subprocess_execute(cmd)
+	output, _stderr = _runtime_command(serv, haproxy_sock_port, f'show acl #{list_id}')
 
 	return render_template('ajax/list.html', list=output, list_id=list_id, color=color, list_name=list_name)
 
@@ -456,27 +544,21 @@ def delete_ip_from_list(serv, ip_id, ip, list_id, list_name) -> str:
 	haproxy_sock_port = sql.get_setting('haproxy_sock_port')
 	lib_path = get_config_var.get_config_var('main', 'lib_path')
 	user_group = roxywi_common.get_user_group(id=1)
-	cmd = f"sed -i 's!{ip}$!!' {lib_path}/lists/{user_group}/{list_name}"
-	cmd1 = f"sed -i '/^$/d' {lib_path}/lists/{user_group}/{list_name}"
-	output, stderr = server_mod.subprocess_execute(cmd)
-	output1, stderr1 = server_mod.subprocess_execute(cmd1)
-	if output:
-		return f'error: {output}'
-	if stderr:
-		return f'error: {stderr}'
-	if output1:
-		return f'error: {output1}'
-	if stderr1:
-		return f'error: {stderr}'
+	list_path = _list_file_path(lib_path, user_group, list_name)
+	list_entries = [
+		line for line in list_path.read_text(encoding='utf-8', errors='replace').splitlines()
+		if line.strip() and line.strip() != ip
+	]
+	content = '\n'.join(list_entries)
+	list_path.write_text(f'{content}\n' if content else '', encoding='utf-8')
 
-	cmd = f'echo "del acl #{list_id} #{ip_id}" |nc {serv} {haproxy_sock_port}'
-	output, stderr = server_mod.subprocess_execute(cmd)
+	output, stderr = _runtime_command(serv, haproxy_sock_port, f'del acl #{list_id} #{ip_id}')
 
 	roxywi_common.logging(serv, f'{ip_id} has been delete from list {list_id}', keep_history=1, service='haproxy')
 	if output[0] != '':
 		return f'error: {output[0]}'
 	if stderr != '':
-		return f'error: {stderr[0]}'
+		return f'error: {stderr}'
 
 	return 'ok'
 
@@ -485,41 +567,35 @@ def add_ip_to_list(serv, ip, list_id, list_name) -> str:
 	haproxy_sock_port = sql.get_setting('haproxy_sock_port')
 	lib_path = get_config_var.get_config_var('main', 'lib_path')
 	user_group = roxywi_common.get_user_group(id=1)
-	cmd = f'echo "add acl #{list_id} {ip}" |nc {serv} {haproxy_sock_port}'
-	output, stderr = server_mod.subprocess_execute(cmd)
+	output, stderr = _runtime_command(serv, haproxy_sock_port, f'add acl #{list_id} {ip}')
 	if output[0]:
 		return f'error: {output[0]}'
 	if stderr:
-		return f'error: {stderr[0]}'
+		return f'error: {stderr}'
 
 	if 'is not a valid IPv4 or IPv6 address' not in output[0]:
-		cmd = f'echo "{ip}" >> {lib_path}/lists/{user_group}/{list_name}'
-		output, stderr = server_mod.subprocess_execute(cmd)
+		list_path = _list_file_path(lib_path, user_group, list_name)
+		with list_path.open('a', encoding='utf-8') as list_file:
+			list_file.write(f'{ip}\n')
 		roxywi_common.logging(serv, f'{ip} has been added to list {list_id}', keep_history=1, service='haproxy')
-		if output:
-			return f'error: {output}'
-		if stderr:
-			return f'error: {stderr}'
 	return 'ok'
 
 
 def select_session(server_ip: str) -> str:
 	lang = roxywi_common.get_user_lang_for_flask()
 	haproxy_sock_port = sql.get_setting('haproxy_sock_port')
-	cmd = f'echo "show sess" |nc {server_ip} {haproxy_sock_port}'
-	output, stderr = server_mod.subprocess_execute(cmd)
+	output, _stderr = _runtime_command(server_ip, haproxy_sock_port, 'show sess')
 
 	return render_template('ajax/sessions_table.html', sessions=output, lang=lang)
 
 
 def show_session(server_ip, sess_id) -> str:
 	haproxy_sock_port = sql.get_setting('haproxy_sock_port')
-	cmd = f'echo "show sess {sess_id}" |nc {server_ip} {haproxy_sock_port}'
-	output, stderr = server_mod.subprocess_execute(cmd)
+	output, stderr = _runtime_command(server_ip, haproxy_sock_port, f'show sess {sess_id}')
 	lines = ''
 
 	if stderr:
-		return 'error: ' + stderr[0]
+		return f'error: {stderr}'
 	else:
 		for o in output:
 			lines += f'{o}<br />'
@@ -528,17 +604,13 @@ def show_session(server_ip, sess_id) -> str:
 
 def delete_session(server_ip, sess_id) -> str:
 	haproxy_sock_port = sql.get_setting('haproxy_sock_port')
-	cmd = f'echo "shutdown session {sess_id}" |nc {server_ip} {haproxy_sock_port}'
-	output, stderr = server_mod.subprocess_execute(cmd)
+	output, stderr = _runtime_command(server_ip, haproxy_sock_port, f'shutdown session {sess_id}')
 	try:
 		if output[0] != '':
 			return 'error: ' + output[0]
 	except Exception:
 		pass
-	try:
-		if stderr[0] != '':
-			return 'error: ' + stderr[0]
-	except Exception:
-		pass
+	if stderr:
+		return f'error: {stderr}'
 
 	return 'ok'

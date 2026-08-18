@@ -1,10 +1,11 @@
 import os
 import json
-import random
 import subprocess
+import tempfile
 import threading
 from datetime import datetime
-from typing import Union, Literal
+from functools import partial
+from typing import Callable, Union, Literal
 from packaging import version
 from urllib.parse import urlparse
 
@@ -26,12 +27,59 @@ from app.modules.roxywi.class_models import ServiceInstall, HAClusterRequest, Ha
 	HaproxyDefaultsRequest, HaproxyConfigRequest
 
 
+ANSIBLE_PRIVATE_DATA_DIR = '/var/www/haproxy-wi/app/scripts/ansible'
+ANSIBLE_INVENTORY_DIR = f'{ANSIBLE_PRIVATE_DATA_DIR}/inventory'
+
+
 def _ansible_runner():
 	# ansible-runner imports Linux-only modules. Keep route imports and unit
 	# tests platform-neutral; load it only when an installation is executed.
 	import ansible_runner
 
 	return ansible_runner
+
+
+def _authorize_installation_servers(json_data: dict) -> None:
+	"""Authorize every server supplied in an installation request body."""
+	for requested_server in json_data.get('servers') or []:
+		server = server_sql.get_server(requested_server['id'])
+		roxywi_common.require_active_group_access(server.group_id)
+
+
+def _create_secure_inventory(inv: dict, ansible_role: str) -> str:
+	"""Write an Ansible inventory to a unique owner-only temporary file."""
+	os.makedirs(ANSIBLE_INVENTORY_DIR, mode=0o700, exist_ok=True)
+	if os.name == 'posix':
+		os.chmod(ANSIBLE_INVENTORY_DIR, 0o700)
+
+	file_descriptor, inventory = tempfile.mkstemp(
+		prefix=f'{ansible_role}-', suffix='.json', dir=ANSIBLE_INVENTORY_DIR, text=True
+	)
+	try:
+		with os.fdopen(file_descriptor, 'w', encoding='utf-8') as inventory_file:
+			json.dump(inv, inventory_file)
+		if os.name == 'posix':
+			os.chmod(inventory, 0o600)
+	except Exception:
+		try:
+			os.close(file_descriptor)
+		except OSError:
+			pass
+		try:
+			os.remove(inventory)
+		except OSError:
+			pass
+		raise
+
+	return inventory
+
+
+def _remove_inventory(inventory: str) -> None:
+	if inventory and os.path.exists(inventory):
+		try:
+			os.remove(inventory)
+		except OSError as error:
+			roxywi_common.logging('Roxy-WI server', f'error: Cannot remove temporary Ansible inventory: {error}')
 
 
 def generate_udp_inv(listener_id: int, action: str) -> object:
@@ -250,114 +298,79 @@ def generate_service_inv(json_data: ServiceInstall, installed_service: str) -> o
 
 
 def run_ansible(inv: dict, server_ips: list, ansible_role: str) -> dict:
-	inventory_path = '/var/www/haproxy-wi/app/scripts/ansible/inventory'
-	inventory = f'{inventory_path}/{ansible_role}-{random.randint(0, 35)}.json'
 	proxy = sql.get_setting('proxy')
-	proxy_serv = ''
+	proxy_serv = proxy if proxy not in (None, '', 'None') else ''
 	tags = ''
+	agent_pid = None
+	inventory = ''
 
 	try:
-		agent_pid = server_mod.start_ssh_agent()
-	except Exception as e:
-		raise Exception(f'Cannot start SSH agent: {e}')
+		try:
+			agent_pid = server_mod.start_ssh_agent()
+		except Exception as error:
+			raise RuntimeError(f'Cannot start SSH agent: {error}') from error
 
-	try:
 		_install_ansible_collections()
-	except Exception as e:
-		raise Exception(f'{e}')
 
-	for server_ip in server_ips:
-		if server_ip != 'localhost':
-			ssh_settings = return_ssh_keys_path(server_ip)
-			if ssh_settings['enabled']:
-				inv['server']['hosts'][server_ip]['ansible_ssh_private_key_file'] = ssh_settings['key']
-			inv['server']['hosts'][server_ip]['ansible_password'] = ssh_settings['password']
-			inv['server']['hosts'][server_ip]['ansible_user'] = ssh_settings['user']
-			inv['server']['hosts'][server_ip]['ansible_port'] = ssh_settings['port']
-			inv['server']['hosts'][server_ip]['ansible_become'] = True
+		for server_ip in server_ips:
+			if server_ip != 'localhost':
+				ssh_settings = return_ssh_keys_path(server_ip)
+				if ssh_settings['enabled']:
+					inv['server']['hosts'][server_ip]['ansible_ssh_private_key_file'] = ssh_settings['key']
+				inv['server']['hosts'][server_ip]['ansible_password'] = ssh_settings['password']
+				inv['server']['hosts'][server_ip]['ansible_user'] = ssh_settings['user']
+				inv['server']['hosts'][server_ip]['ansible_port'] = ssh_settings['port']
+				inv['server']['hosts'][server_ip]['ansible_become'] = True
 
-			if ssh_settings['enabled']:
-				try:
+				if ssh_settings['enabled']:
 					server_mod.add_key_to_agent(ssh_settings, agent_pid)
-				except Exception as e:
-					server_mod.stop_ssh_agent(agent_pid)
-					raise Exception(f'{e}')
 
-		if proxy is not None and proxy != '' and proxy != 'None':
-			proxy_serv = proxy
+			inv['server']['hosts'][server_ip]['PROXY'] = proxy_serv
 
-		inv['server']['hosts'][server_ip]['PROXY'] = proxy_serv
+			if 'DOCKER' in inv['server']['hosts'][server_ip]:
+				tags = 'docker' if inv['server']['hosts'][server_ip]['DOCKER'] else 'system'
 
-		if 'DOCKER' in inv['server']['hosts'][server_ip]:
-			if inv['server']['hosts'][server_ip]['DOCKER']:
-				tags = 'docker'
-			else:
-				tags = 'system'
-
-	envvars = {
-		'ANSIBLE_DISPLAY_OK_HOSTS': 'no',
-		'ANSIBLE_SHOW_CUSTOM_STATS': 'no',
-		'ANSIBLE_DISPLAY_SKIPPED_HOSTS': "no",
-		'ANSIBLE_DEPRECATION_WARNINGS': "no",
-		'ANSIBLE_HOST_KEY_CHECKING': "yes",
-		'ACTION_WARNINGS': "no",
-		'LOCALHOST_WARNING': "no",
-		'COMMAND_WARNINGS': "no",
-		'AWX_DISPLAY': False,
-		'SSH_AUTH_PID': agent_pid['pid'],
-		'SSH_AUTH_SOCK': agent_pid['socket'],
-		'ANSIBLE_PYTHON_INTERPRETER': '/usr/bin/python3'
-	}
-	kwargs = {
-		'private_data_dir': '/var/www/haproxy-wi/app/scripts/ansible/',
-		'inventory': inventory,
-		'envvars': envvars,
-		'playbook': f'/var/www/haproxy-wi/app/scripts/ansible/roles/{ansible_role}.yml',
-		'tags': tags
-	}
-
-	if os.path.isfile(inventory):
-		os.remove(inventory)
-
-	if not os.path.isdir(inventory_path):
-		os.makedirs(inventory_path)
-
-	try:
-		with open(inventory, 'a') as invent:
-			invent.write(str(inv))
-	except Exception as e:
-		server_mod.stop_ssh_agent(agent_pid)
-		roxywi_common.handle_exceptions(e, 'Roxy-WI server', 'Cannot save inventory file')
-
-	try:
-		result = _ansible_runner().run(**kwargs)
-	except Exception as e:
-		server_mod.stop_ssh_agent(agent_pid)
-		roxywi_common.handle_exceptions(e, 'Roxy-WI server', 'Cannot run Ansible')
-
-	try:
-		server_mod.stop_ssh_agent(agent_pid)
-	except Exception as e:
-		roxywi_common.logging('Roxy-WI server', f'error: Cannot stop SSH agent {e}')
-
-	os.remove(inventory)
-
-	if result.rc != 0:
-		raise Exception('Something wrong with installation, check <a href="/logs/internal?log_file=roxy-wi.error.log" target="_blank" class="link">Apache logs</a> for details')
-
-	return result.stats
+		inventory = _create_secure_inventory(inv, ansible_role)
+		envvars = {
+			'ANSIBLE_DISPLAY_OK_HOSTS': 'no',
+			'ANSIBLE_SHOW_CUSTOM_STATS': 'no',
+			'ANSIBLE_DISPLAY_SKIPPED_HOSTS': 'no',
+			'ANSIBLE_DEPRECATION_WARNINGS': 'no',
+			'ANSIBLE_HOST_KEY_CHECKING': 'yes',
+			'ACTION_WARNINGS': 'no',
+			'LOCALHOST_WARNING': 'no',
+			'COMMAND_WARNINGS': 'no',
+			'AWX_DISPLAY': False,
+			'SSH_AUTH_PID': agent_pid['pid'],
+			'SSH_AUTH_SOCK': agent_pid['socket'],
+			'ANSIBLE_PYTHON_INTERPRETER': '/usr/bin/python3'
+		}
+		result = _ansible_runner().run(
+			private_data_dir=ANSIBLE_PRIVATE_DATA_DIR,
+			inventory=inventory,
+			envvars=envvars,
+			playbook=f'{ANSIBLE_PRIVATE_DATA_DIR}/roles/{ansible_role}.yml',
+			tags=tags,
+		)
+		if result.rc != 0:
+			raise RuntimeError(
+				'Something wrong with installation, check '
+				'<a href="/logs/internal?log_file=roxy-wi.error.log" target="_blank" class="link">'
+				'Apache logs</a> for details'
+			)
+		return result.stats
+	finally:
+		_remove_inventory(inventory)
+		if agent_pid is not None:
+			try:
+				server_mod.stop_ssh_agent(agent_pid)
+			except Exception as error:
+				roxywi_common.logging('Roxy-WI server', f'error: Cannot stop SSH agent {error}')
 
 
 def run_ansible_locally(inv: dict, ansible_role: str) -> dict:
-	inventory_path = '/var/www/haproxy-wi/app/scripts/ansible/inventory'
-	inventory = f'{inventory_path}/{ansible_role}-{random.randint(0, 35)}.json'
-	proxy_serv = ''
 	proxy = sql.get_setting('proxy')
-
-	if proxy is not None and proxy != '' and proxy != 'None':
-		proxy_serv = proxy
-
-	inv['server']['hosts']['localhost']['PROXY'] = proxy_serv
+	inv['server']['hosts']['localhost']['PROXY'] = proxy if proxy not in (None, '', 'None') else ''
 
 	envvars = {
 		'ANSIBLE_DISPLAY_OK_HOSTS': 'no',
@@ -371,38 +384,27 @@ def run_ansible_locally(inv: dict, ansible_role: str) -> dict:
 		'AWX_DISPLAY': False,
 		'ANSIBLE_PYTHON_INTERPRETER': '/usr/bin/python3'
 	}
-	kwargs = {
-		'private_data_dir': '/var/www/haproxy-wi/app/scripts/ansible/',
-		'inventory': inventory,
-		'envvars': envvars,
-		'playbook': f'/var/www/haproxy-wi/app/scripts/ansible/roles/{ansible_role}.yml',
-	}
-	if os.path.isfile(inventory):
-		os.remove(inventory)
-
-	if not os.path.isdir(inventory_path):
-		os.makedirs(inventory_path)
-
+	inventory = ''
 	try:
-		with open(inventory, 'a') as invent:
-			invent.write(str(inv))
-	except Exception as e:
-		roxywi_common.handle_exceptions(e, 'Roxy-WI server', 'Cannot save inventory file')
+		inventory = _create_secure_inventory(inv, ansible_role)
+		result = _ansible_runner().run(
+			private_data_dir=ANSIBLE_PRIVATE_DATA_DIR,
+			inventory=inventory,
+			envvars=envvars,
+			playbook=f'{ANSIBLE_PRIVATE_DATA_DIR}/roles/{ansible_role}.yml',
+		)
+		if result.rc != 0:
+			raise RuntimeError(
+				'Something wrong with installation, check '
+				'<a href="/logs/internal?log_file=roxy-wi.error.log" target="_blank" class="link">'
+				'Apache logs</a> for details'
+			)
+		return result.stats
+	finally:
+		_remove_inventory(inventory)
 
-	try:
-		result = _ansible_runner().run(**kwargs)
-	except Exception as e:
-		roxywi_common.handle_exceptions(e, 'Roxy-WI server', 'Cannot run Ansible')
 
-	os.remove(inventory)
-
-	if result.rc != 0:
-		raise Exception('Something wrong with installation, check <a href="/logs/internal?log_file=roxy-wi.error.log" target="_blank" class="link">Apache logs</a> for details')
-
-	return result.stats
-
-
-def service_actions_after_install(server_ips: str, service: str, json_data) -> None:
+def service_actions_after_install(server_ips: list[str], service: str, json_data: dict) -> None:
 	update_functions = {
 		'haproxy': service_sql.update_haproxy,
 		'nginx': service_sql.update_nginx,
@@ -464,16 +466,14 @@ def install_service(service: str, json_data: Union[str, ServiceInstall, HACluste
 	json_data = json_data.model_dump(mode='json')
 	if cluster_id:
 		json_data['cluster_id'] = cluster_id
+	_authorize_installation_servers(json_data)
 	try:
 		inv, server_ips = generate_functions[service](json_data, service)
 	except Exception as e:
 		raise Exception(f'Cannot generate inv {service}: {e}')
 	try:
-		service_actions_after_install(server_ips, service, json_data)
-	except Exception as e:
-		raise Exception(f'Cannot activate {service} on server {server_ips}: {e}')
-	try:
-		return run_ansible_thread(inv, server_ips, service, service.title())
+		on_success = partial(service_actions_after_install, server_ips, service, json_data)
+		return run_ansible_thread(inv, server_ips, service, service.title(), on_success=on_success)
 	except Exception as e:
 		raise Exception(f'Cannot install {service}: {e}')
 
@@ -508,7 +508,10 @@ def _install_ansible_collections():
 					raise Exception(f'error: Ansible collection installation was not successful: {exit_code}. {trouble_link}')
 
 
-def run_ansible_thread(inv: dict, server_ips: list, ansible_role: str, service_name: str) -> int:
+def run_ansible_thread(
+		inv: dict, server_ips: list, ansible_role: str, service_name: str,
+		on_success: Callable[[], None] = None
+) -> int:
 	server_ids = []
 	claims = roxywi_common.get_jwt_token_claims()
 	for server_ip in server_ips:
@@ -518,21 +521,26 @@ def run_ansible_thread(inv: dict, server_ips: list, ansible_role: str, service_n
 	task_id = InstallationTasks.insert(
 		service_name=service_name, server_ids=server_ids, user_id=claims['user_id'], group_id=claims['group']
 	).execute()
-	thread = threading.Thread(target=run_installations, args=(inv, server_ips, ansible_role, task_id))
+	thread = threading.Thread(target=run_installations, args=(inv, server_ips, ansible_role, task_id, on_success))
 	thread.start()
 	return task_id
 
 
-def run_installations(inv: dict, server_ips: list, service: str, task_id: int) -> None:
+def run_installations(
+		inv: dict, server_ips: list, service: str, task_id: int,
+		on_success: Callable[[], None] = None
+) -> None:
+	InstallationTasks.update(status='running').where(InstallationTasks.id == task_id).execute()
 	try:
-		InstallationTasks.update(status='running').where(InstallationTasks.id == task_id).execute()
 		output = run_ansible(inv, server_ips, service)
-		if len(output['failures']) > 0 or len(output['dark']) > 0:
-			InstallationTasks.update(
-				status='failed', finish_date=datetime.now(), error=f'Cannot install {service}. Check Apache error log'
-			).where(InstallationTasks.id == task_id).execute()
-			roxywi_common.logging('', f'error: Cannot install {service}')
-		InstallationTasks.update(status='completed', finish_date=datetime.now()).where(InstallationTasks.id == task_id).execute()
+		if output.get('failures') or output.get('dark'):
+			raise RuntimeError(f'Cannot install {service}. Check Apache error log')
+		if on_success is not None:
+			on_success()
 	except Exception as e:
 		InstallationTasks.update(status='failed', finish_date=datetime.now(), error=str(e)).where(InstallationTasks.id == task_id).execute()
 		roxywi_common.logging('', f'error: Cannot install {service}: {e}')
+	else:
+		InstallationTasks.update(
+			status='completed', finish_date=datetime.now(), error=None
+		).where(InstallationTasks.id == task_id).execute()

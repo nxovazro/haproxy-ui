@@ -1,6 +1,6 @@
 import os
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 from flask import render_template, request, g, jsonify
 from flask_jwt_extended import jwt_required, get_jwt
@@ -163,8 +163,8 @@ def config(service, serv, edit, config_file_name, new):
 @check_services
 @get_user_params(disable=1)
 @validate()
-def versions(service, server_ip: Union[IPvAnyAddress, DomainName]):
-    server_ip = str(server_ip)
+def versions(service, server_ip: Optional[Union[IPvAnyAddress, DomainName]] = None):
+    server_ip = str(server_ip) if server_ip is not None else ''
     roxywi_auth.page_for_admin(level=3)
 
     kwargs = {

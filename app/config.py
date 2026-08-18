@@ -78,6 +78,9 @@ class Configuration(object):
     SESSION_COOKIE_SECURE = True
     SESSION_COOKIE_SAMESITE = 'Lax'
     SESSION_COOKIE_HTTPONLY = True
+    # Canonical external URL used for OIDC redirect URIs when Roxy-WI is
+    # behind a reverse proxy, for example https://roxy-wi.example.com.
+    PUBLIC_URL = os.environ.get('ROXYWI_PUBLIC_URL', '').rstrip('/')
     MAX_CONTENT_LENGTH = int(os.environ.get('ROXYWI_MAX_CONTENT_LENGTH', str(16 * 1024 * 1024)))
     MAX_FORM_MEMORY_SIZE = int(os.environ.get('ROXYWI_MAX_FORM_MEMORY_SIZE', str(2 * 1024 * 1024)))
     FLASK_PYDANTIC_VALIDATION_ERROR_RAISE = True

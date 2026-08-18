@@ -18,6 +18,7 @@ def get_listener_config(listener_id: int) -> dict:
 
 def get_slaves_for_udp_listener(cluster_id: int, vip: str) -> list:
     servers = []
+    ha_sql.get_cluster(cluster_id)
     vips = ha_sql.select_cluster_vips(cluster_id)
     for v in vips:
         if v.vip == vip:
@@ -65,8 +66,10 @@ def listener_actions(listener_id: int, action: str, group_id: int) -> None:
 def check_is_listener_active(listener_id: int) -> str:
     try:
         servers, listener = _return_listener_servers(listener_id)
-    except Exception as e:
-        raise Exception(e)
+    except Exception:
+        # Preserve domain exceptions such as a missing referenced cluster so
+        # the view can return a clean, expected configuration error.
+        raise
     statuses = []
     cmd = f'systemctl is-active keepalived-udp-{listener_id}.service'
     for server_ip in servers:

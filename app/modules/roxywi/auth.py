@@ -2,7 +2,7 @@ from threading import Lock
 from time import monotonic
 from typing import Union
 
-from flask import request, abort, url_for, jsonify
+from flask import request, abort, url_for, jsonify, make_response, redirect
 from flask_jwt_extended import create_access_token, set_access_cookies
 from urllib.parse import urlparse
 
@@ -138,7 +138,7 @@ def check_in_ldap(user, password):
         return True
 
 
-def _safe_next(next_url: str) -> str:
+def safe_next_url(next_url: str) -> str:
     if not next_url:
         return url_for('overview.index')
     parsed = urlparse(next_url)
@@ -150,13 +150,20 @@ def _safe_next(next_url: str) -> str:
 
 
 def do_login(user_params: dict, next_url: str):
-    next_url = _safe_next(next_url)
+    next_url = safe_next_url(next_url)
     redirect_to = f"https://{request.host}{next_url}"
 
     response = jsonify({"status": "done", "next_url": redirect_to})
     access_token = create_jwt_token(user_params)
     set_access_cookies(response, access_token)
 
+    return response
+
+
+def build_login_redirect(user_params: dict, next_url: str):
+    """Issue the normal Roxy-WI JWT cookies and redirect after browser SSO."""
+    response = make_response(redirect(safe_next_url(next_url)))
+    set_access_cookies(response, create_jwt_token(user_params))
     return response
 
 

@@ -79,7 +79,18 @@ $.ajaxSetup({
 });
 $(document).ajaxError(function myErrorHandler(event, xhr, ajaxOptions, thrownError) {
 	if (xhr.status != 401 && xhr.status != 404) {
-		toastr.error(xhr.responseJSON.error);
+		let errorMessage = xhr.responseJSON && xhr.responseJSON.error;
+		if (Array.isArray(errorMessage)) {
+			errorMessage = errorMessage.join(', ');
+		}
+		if (!errorMessage) {
+			if (xhr.status === 0) {
+				errorMessage = 'Cannot connect to the server';
+			} else {
+				errorMessage = thrownError || xhr.statusText || ('HTTP error ' + xhr.status);
+			}
+		}
+		toastr.error(escapeHtml(String(errorMessage)));
 	}
 });
 function showStats() {
@@ -690,6 +701,12 @@ $( function() {
 			});
 			$("#tabs").tabs("option", "active", 7);
 			loadupdatehapwi();
+		});
+		$(".oidc").on("click", function () {
+			$('.menu li ul li').each(function () {
+				activeSubMenu($(this), 'oidc');
+			});
+			$("#tabs").tabs("option", "active", 8);
 		});
 	}
 	$('.copyToClipboard').hover(function (){

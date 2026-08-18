@@ -19,6 +19,7 @@ import app.modules.server.server as server_mod
 import app.modules.service.common as service_common
 import app.modules.roxywi.common as roxywi_common
 import app.modules.roxywi.overview as roxy_overview
+from app.modules.service.haproxy_runtime import execute_runtime_command
 from app.views.service.views import ServiceActionView, ServiceBackendView, ServiceView
 if not app.config['TESTING']:
     from app.views.service.lets_encrypt_views import LetsEncryptView, LetsEncryptsView
@@ -149,18 +150,20 @@ def ssl_service(service):
 @validate()
 def cpu_ram_metrics(server_ip: Union[IPvAnyAddress, DomainName], server_id: int, name: str, service: str):
     if service == 'haproxy':
-        sock_port = sql.get_setting('haproxy_sock_port')
-        cmd = f'echo "show info" |nc {server_ip} {sock_port} -w 1|grep -e "node\|Nbproc\|Maxco\|MB\|Nbthread"'
-        out = server_mod.subprocess_execute(cmd)
-        return_out = ""
-
-        for k in out:
-            if "Ncat:" not in k:
-                for r in k:
-                    return_out += r
-                    return_out += "\n"
-            else:
-                return_out = "Cannot connect to HAProxy"
+        try:
+            output = execute_runtime_command(
+                str(server_ip),
+                int(sql.get_setting('haproxy_sock_port')),
+                'show info',
+                timeout=1,
+            )
+            allowed_fields = ('node', 'Nbproc', 'Maxco', 'MB', 'Nbthread')
+            return_out = '\n'.join(
+                line for line in output.splitlines()
+                if any(field in line for field in allowed_fields)
+            )
+        except Exception:
+            return_out = "Cannot connect to HAProxy"
     else:
         return_out = ''
 

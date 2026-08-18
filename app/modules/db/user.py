@@ -1,6 +1,6 @@
 from peewee import Case, JOIN
 
-from app.modules.db.db_model import User, UserGroups, Groups
+from app.modules.db.db_model import User, UserGroups, Groups, OidcIdentity
 from app.modules.db.sql import get_setting
 from app.modules.db.common import out_error
 import app.modules.roxy_wi_tools as roxy_wi_tools
@@ -71,6 +71,7 @@ def update_user_password(password, user_id):
 
 def delete_user(user_id):
 	try:
+		OidcIdentity.delete().where(OidcIdentity.user_id == user_id).execute()
 		user_for_delete = User.delete().where(User.user_id == user_id)
 		user_for_delete.execute()
 		delete_user_groups(user_id)

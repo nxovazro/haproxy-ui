@@ -18,7 +18,20 @@ import app.modules.service.udp as udp_mod
 import app.modules.service.installation as service_mod
 from app.middleware import get_user_params, check_services, page_for_admin, check_group
 from app.modules.common.common_classes import SupportClass
-from app.modules.roxywi.class_models import BaseResponse, IdResponse, UdpListenerRequest, GroupQuery, DomainName, DataStrResponse
+from app.modules.roxywi.class_models import BaseResponse, ErrorResponse, IdResponse, UdpListenerRequest, GroupQuery, DomainName, DataStrResponse
+from app.modules.roxywi.exception import RoxywiResourceNotFound
+
+
+def _listener_reference_message(listener_id: int, resource_name: str, resource_id: int) -> str:
+    return (
+        f'UDP listener {listener_id} references {resource_name} {resource_id}, but it no longer exists. '
+        'Edit the listener and select an existing resource, or delete the listener.'
+    )
+
+
+def _listener_reference_error(listener_id: int, resource_name: str, resource_id: int):
+    message = _listener_reference_message(listener_id, resource_name, resource_id)
+    return jsonify(ErrorResponse(error=message).model_dump(mode='json')), 409
 
 
 class UDPListener(MethodView):
@@ -98,9 +111,22 @@ class UDPListener(MethodView):
             if listener_id:
                 try:
                     listener_config = udp_mod.get_listener_config(listener_id)
-                    listener_config['status'] = udp_mod.check_is_listener_active(listener_id)
+                except RoxywiResourceNotFound:
+                    return jsonify(ErrorResponse(error=f'UDP listener {listener_id} not found').model_dump(mode='json')), 404
                 except Exception as e:
                     return roxywi_common.handler_exceptions_for_json_data(e, 'Listener not found')
+                try:
+                    listener_config['status'] = udp_mod.check_is_listener_active(listener_id)
+                except RoxywiResourceNotFound:
+                    if listener_config.get('cluster_id'):
+                        return _listener_reference_error(
+                            listener_id, 'HA cluster', listener_config['cluster_id']
+                        )
+                    return _listener_reference_error(
+                        listener_id, 'server', listener_config.get('server_id')
+                    )
+                except Exception as e:
+                    return roxywi_common.handler_exceptions_for_json_data(e, 'Cannot check UDP listener status')
                 return jsonify(listener_config)
         else:
             if not listener_id:
@@ -115,12 +141,23 @@ class UDPListener(MethodView):
                 listener = udp_sql.get_listener(listener_id)
                 cluster = dict()
                 server = dict()
+                configuration_error = ''
                 if listener.cluster_id:
-                    cluster = ha_sql.select_cluster(listener.cluster_id)
+                    cluster = list(ha_sql.select_cluster(listener.cluster_id))
+                    if not cluster:
+                        configuration_error = _listener_reference_message(
+                            listener_id, 'HA cluster', listener.cluster_id
+                        )
                 elif listener.server_id:
-                    server = server_sql.get_server(listener.server_id)
+                    try:
+                        server = server_sql.get_server(listener.server_id)
+                    except RoxywiResourceNotFound:
+                        configuration_error = _listener_reference_message(
+                            listener_id, 'server', listener.server_id
+                        )
                 kwargs = {
                     'clusters': cluster,
+                    'configuration_error': configuration_error,
                     'listener': listener,
                     'server': server,
                     'lang': g.user_params['lang'],
@@ -555,14 +592,20 @@ class UDPListenerBackendStatusView(MethodView):
             return roxywi_common.handler_exceptions_for_json_data(e, 'Cannot get UDP listeners')
 
         if listener.cluster_id:
-            cluster = ha_sql.get_cluster(listener.cluster_id)
+            try:
+                cluster = ha_sql.get_cluster(listener.cluster_id)
+            except RoxywiResourceNotFound:
+                return _listener_reference_error(listener_id, 'HA cluster', listener.cluster_id)
             router_id = ha_sql.get_router_id(cluster.id, 1)
             slaves = ha_sql.select_cluster_slaves(cluster.id, router_id)
 
             for slave in slaves:
                 server_ip = server_sql.get_server(slave[0]).ip
         elif listener.server_id:
-            server_ip = server_sql.get_server(listener.server_id).ip
+            try:
+                server_ip = server_sql.get_server(listener.server_id).ip
+            except RoxywiResourceNotFound:
+                return _listener_reference_error(listener_id, 'server', listener.server_id)
         else:
             return roxywi_common.handler_exceptions_for_json_data(Exception(''), 'Cannot get UDP listeners')
 

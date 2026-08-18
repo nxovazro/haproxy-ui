@@ -1,5 +1,6 @@
 import os
 import subprocess
+from difflib import unified_diff
 from pathlib import Path
 from typing import Any
 
@@ -350,8 +351,7 @@ def diff_config(old_cfg, cfg) -> str:
 	"""
 	Compute the difference between two configuration files and return the result as a string.
 
-	This function executes the `diff` command to compare two configuration files,
-	specified by their paths, and retrieves the resulting differences. The output
+	This function compares two configuration files in Python. The output
 	contains the line-by-line difference between `old_cfg` and `cfg` using the
 	unified diff format. This function is useful for auditing and comparing
 	configuration changes.
@@ -360,12 +360,15 @@ def diff_config(old_cfg, cfg) -> str:
 	:param cfg: Path to the new configuration file to compare.
 	:return: Unified diff output showing the differences between `old_cfg` and `cfg`.
 	"""
-	cmd = f"/bin/diff -ub {old_cfg} {cfg}"
-	output, stderr = server_mod.subprocess_execute(cmd)
-	if stderr:
-		raise Exception(stderr)
-	output = '\n'.join(output)
-	return output
+	try:
+		with open(old_cfg, encoding='utf-8', errors='replace') as old_file:
+			old_lines = old_file.readlines()
+		with open(cfg, encoding='utf-8', errors='replace') as new_file:
+			new_lines = new_file.readlines()
+	except OSError as e:
+		raise Exception(f'Cannot compare configuration files: {e}') from e
+
+	return ''.join(unified_diff(old_lines, new_lines, fromfile=str(old_cfg), tofile=str(cfg)))
 
 
 def _classify_line(line: str) -> str:

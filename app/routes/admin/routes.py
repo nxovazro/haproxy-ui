@@ -13,6 +13,7 @@ from app.middleware import get_user_params
 import app.modules.roxywi.roxy as roxy
 import app.modules.roxywi.auth as roxywi_auth
 import app.modules.roxywi.common as roxywi_common
+from app.modules.oidc.access import is_oidc_available
 import app.modules.tools.common as tools_common
 import app.modules.server.ssh as ssh_mod
 from app.views.admin.views import SettingsView
@@ -45,6 +46,8 @@ def admin():
         servers = roxywi_common.get_dick_permit(virt=1, disable=0, only_group=1)
         sshs = ssh_mod.get_creds(group_id=user_group)
 
+    user_subscription = roxywi_common.return_user_subscription()
+    g.oidc_available = is_oidc_available(user_subscription)
     kwargs = {
         'lang': g.user_params['lang'],
         'users': users,
@@ -55,7 +58,7 @@ def admin():
         'roles': sql.select_roles(),
         'ldap_enable': sql.get_setting('ldap_enable'),
         'services': service_sql.select_services(),
-        'user_subscription': roxywi_common.return_user_subscription(),
+        'user_subscription': user_subscription,
         'users_roles': user_sql.select_users_roles(),
         'user_roles': user_sql.select_user_roles_by_group(user_group),
     }

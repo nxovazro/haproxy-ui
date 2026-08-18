@@ -1,6 +1,6 @@
 import secrets
 
-from app.modules.db.db_model import Groups, Setting, UserGroups
+from app.modules.db.db_model import Groups, Setting, UserGroups, OidcGroupMapping
 from app.modules.db.common import out_error
 from app.modules.roxywi.exception import RoxywiResourceNotFound
 
@@ -87,6 +87,7 @@ def add_setting_for_new_group(group_id):
 
 def delete_group(group_id):
 	try:
+		OidcGroupMapping.delete().where(OidcGroupMapping.group_id == group_id).execute()
 		Groups.delete().where(Groups.group_id == group_id).execute()
 		UserGroups.delete().where(UserGroups.user_group_id == group_id).execute()
 	except Exception as e:

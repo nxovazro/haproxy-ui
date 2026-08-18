@@ -79,3 +79,73 @@ def test_haproxy_info_parser_ignores_malformed_and_unknown_lines():
     ])
 
     assert parsed == {'Version': '3.1.7', 'Process': '1'}
+
+
+@pytest.mark.security
+def test_apache_status_uses_http_client_without_exposing_credentials_to_shell(app, monkeypatch):
+    requests = []
+    settings = {
+        'apache_stats_user': 'status-user',
+        'apache_stats_password': 'secret; touch /tmp/pwned',
+        'apache_stats_port': '8080',
+        'apache_stats_page': '/server-status',
+    }
+    server = SimpleNamespace(
+        ip='192.0.2.20',
+        apache_active=1,
+        apache_alert=0,
+        apache_metrics=1,
+    )
+
+    class Response:
+        text = (
+            'ServerVersion: Apache/2.4.62 (Unix)\n'
+            'ServerUptime: 1 day 2 hours\n'
+            'Processes: 3\n'
+        )
+
+        @staticmethod
+        def raise_for_status():
+            return None
+
+    monkeypatch.setattr(
+        'app.views.service.views.SupportClass.return_server_ip_or_id',
+        lambda self, server_reference: 65,
+    )
+    monkeypatch.setattr(
+        'app.views.service.views.server_sql.get_server_with_group',
+        lambda server_id, group_id: server,
+    )
+    monkeypatch.setattr(
+        'app.views.service.views.sql.get_setting',
+        lambda setting: settings[setting],
+    )
+    monkeypatch.setattr(
+        'app.views.service.views.service_sql.select_service_setting',
+        lambda server_id, service, setting: '0',
+    )
+    monkeypatch.setattr(
+        'app.views.service.views.server_mod.subprocess_execute',
+        lambda command: (_ for _ in ()).throw(AssertionError('Apache status must not invoke a shell')),
+    )
+    monkeypatch.setattr(
+        'app.views.service.views.requests.get',
+        lambda url, **kwargs: requests.append((url, kwargs)) or Response(),
+    )
+
+    with app.test_request_context('/service/apache/65/status'):
+        g.user_params = {'group_id': 7}
+        response = ServiceView().get('apache', 65)
+        data = response.get_json()
+
+    assert requests == [(
+        'http://192.0.2.20:8080/server-status?auto',
+        {
+            'auth': ('status-user', 'secret; touch /tmp/pwned'),
+            'timeout': 5,
+        },
+    )]
+    assert data['Version'] == '2.4.62'
+    assert data['Uptime'] == '1 day 2 hours'
+    assert data['Process'] == '3'
+    assert data['status'] == 'running'

@@ -46,22 +46,35 @@ $( function() {
 		<span id="logo_span">
 			<img src="{{ url_for('static', filename='images/logo_login.png')}}">
 		</span>
-		<form class="form-horizontal" id="auth" method="post">
-			<div class="fontuser">
-				{{ input('login', class='form-login', placeholder=lang.words.login|title(), required='required', autofocus='autofocus') }}
-				<i class="fa fa-user fa-lg"></i>
+		<div class="login-auth-column">
+			<form class="form-horizontal" id="auth" method="post">
+				<div class="fontuser">
+					{{ input('login', class='form-login', placeholder=lang.words.login|title(), required='required', autofocus='autofocus') }}
+					<i class="fa fa-user fa-lg"></i>
+				</div>
+				<br>
+				<div class="fontpassword">
+					{{ input('pass', type='password', class='form-login', placeholder=lang.words.password|title(), required='required') }}
+					{{ input('ref', type='hidden', value=ref) }}
+					<i class="fa fa-key fa-lg"></i>
+					<span onclick="showPassword('pass')" title="{{lang.words.show|title()}} {{lang.words.password}}">
+					<i class="far fa-eye"></i>
+						</span>
+				</div>
+				<button type="submit" name="Login" value="Enter" id="enter">{{lang.words.login2|title()}}</button>
+			</form>
+			{% if oidc_providers %}
+			<div class="oidc-login-separator"><span>{{ lang.oidc_page.or }}</span></div>
+			<div class="oidc-login-providers">
+				{% for provider in oidc_providers %}
+				<a class="oidc-login-button" href="{{ url_for('oidc.oidc_login', slug=provider.slug, next=request.args.get('next', '')) }}">
+					<i class="fa fa-sign-in-alt"></i>
+					{{ lang.oidc_page.sign_in_with }} {{ provider.label }}
+				</a>
+				{% endfor %}
 			</div>
-			<br>
-			<div class="fontpassword">
-				{{ input('pass', type='password', class='form-login', placeholder=lang.words.password|title(), required='required') }}
-				{{ input('ref', type='hidden', value=ref) }}
-				<i class="fa fa-key fa-lg"></i>
-				<span onclick="showPassword('pass')" title="{{lang.words.show|title()}} {{lang.words.password}}">
-				<i class="far fa-eye"></i>
-					</span>
-			</div>
-			<button type="submit" name="Login" value="Enter" id="enter">{{lang.words.login2|title()}}</button>
-		</form>
+			{% endif %}
+		</div>
     </div>
 		{% if error_log or error %}
 		<div class="alert alert-danger wrong-login alert-one-row" style="display: block; float: left;">

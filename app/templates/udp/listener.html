@@ -2,7 +2,7 @@
 {% from 'include/input_macros.html' import input, checkbox, copy_to_clipboard %}
 {% set checker_desc = lang.services.hapservers_desc %}
 <script src="/static/js/udp.js"></script>
-<div id="listener-{{listener.id}}" class="div-server-hapwi div-server-head-dis">
+<div id="listener-{{listener.id}}" class="div-server-hapwi div-server-head-dis{% if configuration_error %} udp-listener-invalid{% endif %}">
     <div class="server-name">
         <span class="overflow name-span">
             <span id="listener-name-{{listener.id}}">{{listener.name|replace("'", "")}}</span>
@@ -19,6 +19,9 @@
             <a href="{{ url_for('main.service_history', service='udp', server_ip=listener.id) }}" title="{{lang.words.view|title()}} {{lang.words.history3}} {{listener.name}}" class="history" style="margin: 0 5px 0 10px;"></a>
         </span>
     </div>
+    {% if configuration_error %}
+    <div class="alert alert-danger udp-listener-reference-error" role="alert">{{ configuration_error }}</div>
+    {% endif %}
     <div class="server-desc">
         {% if listener.cluster_id %}
             {% for cluster in clusters %}
@@ -44,10 +47,12 @@
                 <span id="backend_server_status_{{ listener.id }}_{{ c.backend_ip|replace('.', '') }}" class="server-status-small serverNone"></span>
             {{ lang.words.server|title() }}: {{ copy_to_clipboard(value=c.backend_ip) }}, {{ lang.words.port }}: {{ c.port }}, {{ lang.words.weight }}: {{ c.weight }}
                 </div>
+                {% if not configuration_error %}
                 <script>
                     checkUdpBackendStatus('{{ listener.id }}', '{{ c.backend_ip }}')
                     setInterval(checkUdpBackendStatus, 60000, '{{listener.id}}', '{{ c.backend_ip }}');
                 </script>
+                {% endif %}
             {% endfor %}
         </div>
         <div class="udp-act-links" id="server-{{listener.id|string()}}">
@@ -62,7 +67,9 @@
         </div>
     </div>
 </div>
+{% if not configuration_error %}
 <script>
     checkStatus('{{listener.id}}');
     setInterval(checkStatus, 25000, '{{listener.id}}');
 </script>
+{% endif %}

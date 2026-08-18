@@ -25,3 +25,21 @@
 .div-server-hapwi {
     height: 135px;
 }
+
+.div-server-hapwi.udp-listener-invalid {
+    height: auto;
+    min-height: 135px;
+}
+
+.alert.alert-danger.udp-listener-reference-error {
+    clear: both;
+    box-sizing: border-box;
+    margin: 4px 0 8px;
+    padding: 8px 10px;
+    line-height: 1.35;
+}
+
+.udp-listener-invalid .server-desc {
+    height: auto;
+    min-height: 80px;
+}

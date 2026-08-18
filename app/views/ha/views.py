@@ -407,7 +407,7 @@ class HAView(MethodView):
                 except Exception as e:
                     raise e
 
-        return jsonify({"status": "accepted", "tasks_ids": [tasks_ids]}), 202
+        return jsonify({"status": "accepted", "tasks_ids": tasks_ids}), 202
 
 
 class HAVIPView(MethodView):

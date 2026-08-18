@@ -1,3 +1,5 @@
+import re
+
 from flask import render_template, request, g, jsonify
 from flask_jwt_extended import jwt_required
 
@@ -5,10 +7,14 @@ from app.routes.portscanner import bp
 from app.middleware import get_user_params
 import app.modules.db.server as server_sql
 import app.modules.db.portscanner as ps_sql
-import app.modules.server.server as server_mod
+from app.modules.server.command import run_local
 import app.modules.roxywi.common as roxywi_common
 import app.modules.tools.common as tools_common
 import app.modules.common.common as common
+
+
+_NMAP_HOST_TIMEOUT_SECONDS = 40
+_NMAP_PROCESS_TIMEOUT_SECONDS = 45
 
 
 @bp.before_request
@@ -75,21 +81,40 @@ def change_settings_portscanner():
 
 @bp.post('/scan')
 def scan_port():
-    json_data = request.get_json()
+    json_data = request.get_json(silent=True)
+    if not isinstance(json_data, dict):
+        return jsonify({'error': 'JSON request body is required'}), 400
+
     if 'id' in json_data:
         ip = server_sql.get_server(int(json_data['id'])).ip
     else:
-        ip = common.is_ip_or_dns(json_data['ip'])
+        ip = common.is_ip_or_dns(json_data.get('ip', ''))
+        if not ip:
+            return jsonify({'error': 'Invalid IP address or DNS name'}), 400
 
-    cmd = f"sudo nmap -sS {ip} |grep -E '^[[:digit:]]'|sed 's/  */ /g'"
-    cmd1 = f"sudo nmap -sS {ip} |head -5|tail -2"
+    result = run_local(
+        [
+            'sudo', '-n', 'nmap', '-n', '-sS', '-T4', '--max-retries', '1',
+            '--host-timeout', f'{_NMAP_HOST_TIMEOUT_SECONDS}s', ip,
+        ],
+        timeout=_NMAP_PROCESS_TIMEOUT_SECONDS,
+    )
+    scan_output = f'{result.stdout}\n{result.stderr}'.lower()
+    if result.timed_out or 'host timeout' in scan_output:
+        return jsonify({
+            'error': f'Port scan exceeded {_NMAP_PROCESS_TIMEOUT_SECONDS} seconds',
+        }), 408
+    if not result.succeeded:
+        return jsonify({'error': result.stderr or 'Cannot scan ports'}), 502
 
-    stdout, stderr = server_mod.subprocess_execute(cmd)
-    stdout1, stderr1 = server_mod.subprocess_execute(cmd1)
+    output_lines = result.stdout_lines
+    ports = [
+        re.sub(r'\s+', ' ', line.strip())
+        for line in output_lines
+        if line and line[0].isdigit()
+    ]
+    info = output_lines[3:5]
 
-    if stderr != '':
-        return jsonify({'error': stderr})
-    else:
-        lang = roxywi_common.get_user_lang_for_flask()
-        temp = render_template('ajax/scan_ports.html', ports=stdout, info=stdout1, lang=lang)
-        return jsonify({'status': 'Ok', 'data': temp})
+    lang = roxywi_common.get_user_lang_for_flask()
+    temp = render_template('ajax/scan_ports.html', ports=ports, info=info, lang=lang)
+    return jsonify({'status': 'Ok', 'data': temp})

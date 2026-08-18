@@ -100,6 +100,14 @@ python3 scheduler_runner.py
 
 `scheduler_runner.py` enables `ROXYWI_SCHEDULER_ENABLED=1` for that process. Do not set this variable globally for the web service.
 
+## OpenID Connect
+
+Super administrators can configure one or more OIDC providers under **Admin → OIDC**. Roxy-WI supports discovery metadata, signed ID token validation through JWKS, optional UserInfo claims, verified-email/domain policies, automatic user creation or email linking, and external-group mappings to Roxy-WI groups and roles. Local and LDAP login remain available.
+
+When Roxy-WI is behind a reverse proxy, set `ROXYWI_PUBLIC_URL` to its canonical external origin, without a trailing slash, for example `https://roxy-wi.example.com`. Register the callback URL shown in the provider form at the identity provider. The usual scopes are `openid email profile`; add the provider-specific groups scope when group mapping is used.
+
+OIDC client secrets are encrypted with the existing `[main] secret_phrase` Fernet key. Keep the same key during a normal upgrade; no new key or credential rotation is required.
+
 ### Read instruction on the official [site](https://roxy-wi.org/settings)
 
 ![alt text](https://roxy-wi.org/static/images/hapwi_overview.webp "HAProxy server overview page")

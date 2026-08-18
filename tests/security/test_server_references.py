@@ -71,3 +71,34 @@ def test_runtime_ip_argument_still_uses_ip_lookup(app, monkeypatch):
         roxywi_common.require_request_server_access()
 
     assert calls == [('ip', '192.0.2.11')]
+
+
+@pytest.mark.security
+def test_global_admin_can_access_server_from_another_group(app, monkeypatch):
+    monkeypatch.setattr(
+        roxywi_common.server_sql,
+        'get_server',
+        lambda server_id: SimpleNamespace(server_id=server_id, ip='192.0.2.52', group_id=9),
+    )
+
+    with app.test_request_context('/server/check/server/52'):
+        g.user_params = {'group_id': 1, 'role': 1}
+        request.view_args = {'server_id': 52}
+        roxywi_common.require_request_server_access()
+
+
+@pytest.mark.security
+def test_group_admin_cannot_access_server_from_another_group(app, monkeypatch):
+    monkeypatch.setattr(
+        roxywi_common.server_sql,
+        'get_server',
+        lambda server_id: SimpleNamespace(server_id=server_id, ip='192.0.2.52', group_id=9),
+    )
+
+    with app.test_request_context('/server/check/server/52'):
+        g.user_params = {'group_id': 1, 'role': 2}
+        request.view_args = {'server_id': 52}
+        with pytest.raises(Exception) as exception:
+            roxywi_common.require_request_server_access()
+
+    assert getattr(exception.value, 'code', None) == 403
