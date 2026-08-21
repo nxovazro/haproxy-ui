@@ -119,6 +119,7 @@ echo ""
 # Initialize database
 echo "Initializing database..."
 cd "$PROJECT_ROOT"
+export ROXYWI_CONFIG="$CONFIG_FILE"
 python3 app/create_db.py > /dev/null 2>&1 || {
     echo -e "${YELLOW}Warning: Database initialization may have issues${NC}"
 }
